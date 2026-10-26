@@ -16,6 +16,8 @@ FIELD_L, FIELD_R = 40, 217          # внутренность поля по x: 
 PADDLE_TOP = 176                    # верх ракетки
 PAD_CENTER_MIN, PAD_CENTER_MAX = 52, 203
 LAG = 3                             # кадров между командой мыши и её видимостью на экране
+BALL_HIT_Y = 173                    # центр мяча по y в момент удара о ракетку
+BALL_X_MIN, BALL_X_MAX = 42, 214    # крайние положения центра мяча по x (у стенок)
 
 W = np.array([255, 255, 255], np.uint8)
 S = np.array([170, 170, 170], np.uint8)
@@ -43,32 +45,58 @@ def find_paddle(f):
     return (run[0] + run[-1]) / 2 + FIELD_L
 
 
+# мяч 5x5: '.' — не проверяем (углы бывают поверх кирпичей), остальное — точный цвет
+BALL = [".sss.", "sWWsd", "sWssd", "sssdd", ".ddd."]
+_COL = {"s": (170, 170, 170), "W": (255, 255, 255), "d": (85, 85, 85)}
+_BALL_PIX = [(dy, dx, _COL[c]) for dy, row in enumerate(BALL) for dx, c in enumerate(row) if c != "."]
+
+
+def code(f):
+    """Кадр -> одна целочисленная плоскость (по цвету EGA)."""
+    return (f[..., 0].astype(np.int32) << 16) | (f[..., 1].astype(np.int32) << 8) | f[..., 2]
+
+
+def find_balls(f, c=None):
+    """Центры всех мячей [(x, y)] в поле."""
+    c = code(f) if c is None else c
+    reg = c[8:192, FIELD_L - 2:FIELD_R + 2]
+    h, w = reg.shape
+    ok = np.ones((h - 4, w - 4), bool)
+    for dy, dx, col in _BALL_PIX:
+        v = (col[0] << 16) | (col[1] << 8) | col[2]
+        ok &= reg[dy:dy + h - 4, dx:dx + w - 4] == v
+    ys, xs = np.nonzero(ok)
+    return [(int(x) + FIELD_L - 2 + 2, int(y) + 8 + 2) for y, x in zip(ys, xs)]
+
+
 def find_ball(f):
-    """Центр мяча (x, y) или None. Мяч: 5x5, вверху-слева белые пиксели 'WW' над 'W', обрамлены серым."""
-    reg = f[8:190, FIELD_L:FIELD_R]
-    w = (reg == W).all(2)
-    s = (reg == S).all(2)
-    # ядро мяча: W W в строке y, W в строке y+1 под левым, серый справа от него; s слева от обоих
-    core = w[:-1, 1:-2] & w[:-1, 2:-1] & w[1:, 1:-2] & s[1:, 2:-1] & s[:-1, :-3] & s[1:, :-3]
-    ys, xs = np.nonzero(core)
-    if len(ys) == 0:
+    b = find_balls(f)
+    return b[0] if b else None
+
+
+# цифры счёта: битовые маски 6x6 (белые пиксели), сняты с экрана при известном счёте
+DIGITS = {0x7b3cf3cde: 0, 0x31c30c79e: 1, 0x7b30dec3f: 2, 0x7b3183cde: 3, 0x18e5a6fc6: 4,
+          0xff0f83cde: 5, 0x7b0fb3cde: 6, 0xfc318630c: 7, 0x7b37b3cde: 8, 0x7b3cdf0de: 9}
+
+
+def read_score(f):
+    """Счёт с экрана (6 цифр справа от поля) или None."""
+    if f.shape[0] != 200:
         return None
-    # исключаем находки внутри кирпичей/стенок: над ядром должен быть серый верх мяча и чёрное вокруг
-    best = None
-    for y, x in zip(ys, xs):
-        yy, xx = y + 8, x + FIELD_L  # координата ядра (левый W) в кадре = xx+1
-        cx, cy = xx + 2, yy + 1
-        if yy - 1 < 0:
-            continue
-        top = f[yy - 1, xx + 1:xx + 4]
-        if not (top == S).all():
-            continue
-        corner = f[yy - 1, xx]
-        if corner.any():
-            continue
-        best = (cx, cy)
-        break
-    return best
+    v = 0
+    for k in range(6):
+        g = (f[63:69, 241 + 8 * k:247 + 8 * k] == 255).all(2).flatten()
+        bits = int("".join("1" if b else "0" for b in g), 2)
+        if bits not in DIGITS:
+            return None
+        v = v * 10 + DIGITS[bits]
+    return v
+
+
+def count_lives(f):
+    """Число запасных ракеток (иконки внизу слева)."""
+    row = f[194, FIELD_L:FIELD_R].any(1)
+    return int(np.sum(row[1:] & ~row[:-1]) + row[0])
 
 
 def blue_menu(f):
@@ -82,12 +110,10 @@ class Player:
         self.phase = "boot"
         self.phase_t = 0
         self.snapshot = None
-        self.pos = 128.0          # где, по нашим командам, должна быть ракетка
-        self.hist = []            # история команд (для учёта задержки)
-        self.ball_prev = None
-        self.ball_vel = None
+        self.moves = [0.0] * LAG    # сдвиги ракетки по последним командам, ещё не видимые на экране
+        self.est = 128.0            # оценка текущей позиции ракетки (с учётом невидимых сдвигов)
+        self.track = []             # история (x, y) отслеживаемого мяча без отскоков
         self.still = 0
-        self.mismatch = 0
 
     # --- меню до игры ---
     def menus(self, f):
@@ -103,8 +129,7 @@ class Player:
             return [], Mouse()
         if self.phase == "video":
             # ждём смены текста меню (меню устройства ввода)
-            if blue_menu(f) and \
-                    (f[60:140] != self.snapshot).any() and self.phase_t > 30:
+            if blue_menu(f) and (f[60:140] != self.snapshot).any() and self.phase_t > 30:
                 self.phase, self.phase_t = "device", 0
                 return [Key.M], Mouse()
             return [], Mouse()
@@ -119,65 +144,87 @@ class Player:
         self.t += 1
         f = frame
         if self.phase != "game":
-            if f.shape[0] == 200 and in_game(f):
+            if f is not None and f.shape[0] == 200 and in_game(f):
                 self.phase = "game"
             else:
-                return self.menus(f)
+                return self.menus(f) if f is not None else ([], Mouse())
         if not in_game(f):
-            return [], Mouse()
+            return self.command(self.est, False)
         return self.play(f)
+
+    def command(self, target, click):
+        """Поставить ракетку в target (центр по x) с учётом невидимых ещё сдвигов."""
+        target = min(max(target, PAD_CENTER_MIN), PAD_CENTER_MAX)
+        dx = int(round((target - self.est) * 4))
+        move = dx / 4
+        self.est = min(max(self.est + move, PAD_CENTER_MIN), PAD_CENTER_MAX)
+        self.moves = self.moves[1:] + [move]
+        return [], Mouse(dx=dx, left=click)
 
     # --- игра ---
     def play(self, f):
         pad = find_paddle(f)
-        ball = find_ball(f)
-        # сверка: экран показывает позицию, заданную LAG кадров назад
-        if pad is not None and len(self.hist) >= LAG:
-            expected = self.hist[-LAG]
-            if abs(pad - expected) > 1.0:
-                self.mismatch += 1
-                if self.mismatch >= 2:
-                    self.pos += pad - expected
-                    self.hist = [h + (pad - expected) for h in self.hist]
-                    self.mismatch = 0
-            else:
-                self.mismatch = 0
+        if pad is not None:
+            # экран показывает позицию до последних LAG команд
+            self.est = min(max(pad + sum(self.moves), PAD_CENTER_MIN), PAD_CENTER_MAX)
+        balls = find_balls(f)
+        ball = self.pick_ball(balls)
+        vel = self.update_track(ball)
 
-        if ball is not None and self.ball_prev is not None:
-            self.ball_vel = (ball[0] - self.ball_prev[0], ball[1] - self.ball_prev[1])
-        self.ball_prev = ball
-
-        target = self.pos
-        click = False
+        target, click = self.est, False
         if ball is not None:
-            target = self.choose_target(ball, self.ball_vel)
+            target = self.choose_target(ball, vel)
             # мяч лежит на ракетке — запустить
-            if self.ball_vel == (0, 0) and ball[1] >= PADDLE_TOP - 6:
+            if vel is not None and vel == (0.0, 0.0) and ball[1] >= PADDLE_TOP - 6:
                 self.still += 1
             else:
                 self.still = 0
             click = self.still > 5 and self.still % 10 < 2
+        return self.command(target, click)
 
-        target = min(max(target, PAD_CENTER_MIN), PAD_CENTER_MAX)
-        dx = int(round((target - self.pos) * 4))
-        self.pos += dx / 4
-        self.hist.append(self.pos)
-        if len(self.hist) > 20:
-            self.hist.pop(0)
-        return [], Mouse(dx=dx, left=click)
+    def pick_ball(self, balls):
+        if not balls:
+            return None
+        if self.track:
+            lx, ly = self.track[-1]
+            return min(balls, key=lambda b: abs(b[0] - lx) + abs(b[1] - ly))
+        return max(balls, key=lambda b: b[1])
+
+    def update_track(self, ball):
+        """Скорость мяча по прямолинейному участку траектории (сброс при отскоке)."""
+        if ball is None:
+            self.track = []
+            return None
+        tr = self.track
+        if len(tr) >= 2:
+            n = len(tr)
+            vx = (tr[-1][0] - tr[0][0]) / (n - 1)
+            vy = (tr[-1][1] - tr[0][1]) / (n - 1)
+            px, py = tr[-1][0] + vx, tr[-1][1] + vy
+            if abs(ball[0] - px) > 2.5 or abs(ball[1] - py) > 2.5:
+                tr = [tr[-1]]
+        elif len(tr) == 1 and (abs(ball[0] - tr[0][0]) > 8 or abs(ball[1] - tr[0][1]) > 8):
+            tr = []
+        tr = (tr + [ball])[-12:]
+        self.track = tr
+        if len(tr) < 2:
+            return None
+        n = len(tr)
+        return ((tr[-1][0] - tr[0][0]) / (n - 1), (tr[-1][1] - tr[0][1]) / (n - 1))
 
     def choose_target(self, ball, vel):
         x, y = ball
         if vel is None or vel[1] <= 0:
             return x
+        return self.landing_x(x, y, vel)
+
+    @staticmethod
+    def landing_x(x, y, vel):
+        """Где будет центр мяча на высоте удара о ракетку (с отражениями от боковых стенок)."""
         vx, vy = vel
-        # предсказание точки, где центр мяча окажется на высоте удара о ракетку
-        hit_y = PADDLE_TOP - 3
-        steps = (hit_y - y) / vy
+        steps = (BALL_HIT_Y - y) / vy
         px = x + vx * steps
-        lo, hi = FIELD_L + 2, FIELD_R - 3
+        lo, hi = BALL_X_MIN, BALL_X_MAX
         span = hi - lo
-        # отражения от стенок
         u = (px - lo) % (2 * span)
-        px = lo + (u if u <= span else 2 * span - u)
-        return px
+        return lo + (u if u <= span else 2 * span - u)
