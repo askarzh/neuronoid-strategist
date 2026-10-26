@@ -16,7 +16,7 @@ for t in range(t1):
     keys, mouse = pl.act(f)
     if t >= t0:
         ball = P.find_ball(f); pad = P.find_paddle(f)
-        print(t, "ball", ball, "vel", pl.ball_vel, "pad", pad, "pos", pl.pos, "dx", mouse.dx, "L" if mouse.left else "")
+        print(t, "ball", ball, "trk", pl.track[-3:], "aim", pl.aim, "pad", pad, "est", pl.est, "dx", mouse.dx, "L" if mouse.left else "")
         Image.fromarray(f).save(out / f"t{t:06d}.png")
     emu.step(keys, frames=1, mouse=mouse)
     f = emu.frame()

@@ -20,8 +20,11 @@ def main(minutes=20.0, outdir="runs/bench", every=2000):
     f = emu.frame()
     score, lives, last_lives = 0, None, None
     events = []
+    ring = []  # последние кадры с состоянием игрока — для разбора потерь
     for t in range(n):
         keys, mouse = pl.act(f)
+        ring.append((t, f, f"ball {pl.track[-1] if pl.track else None} n={len(pl.track)} aim {pl.aim} est {pl.est:.1f} pad {P.find_paddle(f) if f.shape[0]==200 else None} dx {mouse.dx}"))
+        ring = ring[-150:]
         emu.step(keys, frames=1, mouse=mouse)
         f = emu.frame()
         if P.in_game(f):
@@ -30,6 +33,10 @@ def main(minutes=20.0, outdir="runs/bench", every=2000):
             lv = P.count_lives(f)
             if last_lives is not None and lv < last_lives:
                 events.append((t, "life lost", score)); Image.fromarray(f).save(out / f"lost_{t:06d}.png")
+                d = out / f"lost_{t:06d}"; d.mkdir(exist_ok=True)
+                with open(d / "trace.txt", "w") as fh:
+                    for tt, ff, s in ring:
+                        fh.write(f"{tt} {s}\n"); Image.fromarray(ff).save(d / f"{tt:06d}.png")
             last_lives = lv
         if t % every == 0:
             Image.fromarray(f).save(out / f"f{t:06d}.png")

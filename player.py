@@ -45,6 +45,16 @@ def find_paddle(f):
     return (run[0] + run[-1]) / 2 + FIELD_L
 
 
+def paddle_half(f):
+    """Полуширина ракетки: белая полоса + 5 пикселей с каждой стороны (красные концы)."""
+    row = (f[177, FIELD_L:FIELD_R] == W).all(1)
+    xs = np.flatnonzero(row)
+    if len(xs) < 6:
+        return None
+    runs = np.split(xs, np.flatnonzero(np.diff(xs) > 1) + 1)
+    return max(len(r) for r in runs) / 2 + 5
+
+
 # мяч 5x5: '.' — не проверяем (углы бывают поверх кирпичей), остальное — точный цвет
 BALL = [".sss.", "sWWsd", "sWssd", "sssdd", ".ddd."]
 _COL = {"s": (170, 170, 170), "W": (255, 255, 255), "d": (85, 85, 85)}
@@ -104,16 +114,98 @@ def blue_menu(f):
     return f.shape == (400, 640, 3) and (f[::8, ::8] == [0, 0, 170]).all(2).mean() > 0.3
 
 
+# --- кирпичи: сетка 11 столбцов x 22 ряда, ячейка 16x8, кирпич 15x7 в (41+16c, 1+8r) ---
+ROWS, COLS = 22, 11
+EMPTY, NORMAL, SILVER, GOLD = 0, 1, 2, 3
+
+
+def read_bricks(f):
+    """Сетка типов кирпичей по экрану."""
+    g = np.zeros((ROWS, COLS), np.int8)
+    for r in range(1, ROWS):
+        y = 1 + 8 * r
+        if y + 7 > PADDLE_TOP:
+            break
+        blk = f[y:y + 7, 41:41 + 16 * COLS].reshape(7, COLS, 16, 3)[:, :, :15]
+        filled = (blk.sum(3) > 0).mean(axis=(0, 2)) >= 0.9
+        for c in np.flatnonzero(filled):
+            b = blk[:, c]
+            if (b[0] == 255).all() and (b[:, 0] == 255).all():   # белая рамка сверху и слева
+                fill = tuple(b[3, 7])
+                g[r, c] = SILVER if fill == (170, 170, 170) else GOLD if fill == (255, 255, 85) else NORMAL
+            else:
+                g[r, c] = NORMAL
+    return g
+
+
+# направления отскока от ракетки по зонам смещения (мяч − центр ракетки): (смещение-цель, единичный вектор)
+# Пологие зоны ([-12,-9] и [8,12]) не используем: пологий мяч на высокой скорости слишком легко
+# упустить краем ракетки (3 потери из 3 в прогоне b5), а угол подлёта всегда равен углу отскока.
+ZONES = [(-6.5, (-0.707, -0.707)), (-2.5, (-0.26, -0.97)), (1.5, (0.26, -0.97)), (5.5, (0.707, -0.707))]
+BALL_Y_MIN = 10
+R = 2.5  # полуразмер мяча
+
+
+def simulate(grid, x, y, vx, vy, limit=400):
+    """Полёт мяча от ракетки до первого разбитого кирпича (золото отражает) или до возвращения к ракетке.
+    Возвращает (кадры, (ряд, столбец) или None, x возврата, vx возврата, мин. расстояние до разбиваемого кирпича)."""
+    targets = np.argwhere((grid == NORMAL) | (grid == SILVER))
+    tc = np.stack([41 + 16 * targets[:, 1] + 7, 1 + 8 * targets[:, 0] + 3], 1) if len(targets) else None
+
+    def hit(px, py):
+        c = int((px - 41 + R) // 16), int((px - 41 - R) // 16)
+        r = int((py - 1 + R) // 8), int((py - 1 - R) // 8)
+        for rr in {r[0], r[1]}:
+            for cc in {c[0], c[1]}:
+                if 0 <= rr < ROWS and 0 <= cc < COLS and grid[rr, cc]:
+                    bx, by = 41 + 16 * cc, 1 + 8 * rr
+                    if bx - R <= px < bx + 15 + R and by - R <= py < by + 7 + R:
+                        return rr, cc
+        return None
+    mind = 1e9
+    for t in range(1, limit):
+        nx = x + vx
+        h = hit(nx, y)
+        if h:
+            if grid[h] != GOLD:
+                return t, h, x, vx, 0.0
+            vx = -vx
+        elif nx < BALL_X_MIN or nx > BALL_X_MAX:
+            vx = -vx
+        else:
+            x = nx
+        ny = y + vy
+        h = hit(x, ny)
+        if h:
+            if grid[h] != GOLD:
+                return t, h, x, vx, 0.0
+            vy = -vy
+        elif ny < BALL_Y_MIN:
+            vy = -vy
+        else:
+            y = ny
+        if tc is not None and t % 4 == 0:
+            mind = min(mind, float(np.min(np.abs(tc[:, 0] - x) + np.abs(tc[:, 1] - y))))
+        if y > BALL_HIT_Y:
+            return t, None, x, vx, mind
+    return limit, None, x, vx, mind
+
+
 class Player:
     def __init__(self):
         self.t = 0
         self.phase = "boot"
         self.phase_t = 0
         self.snapshot = None
-        self.moves = [0.0] * LAG    # сдвиги ракетки по последним командам, ещё не видимые на экране
+        self.moves = [0.0] * (LAG + 1)  # сдвиги ракетки по последним командам, ещё не видимые на экране
         self.est = 128.0            # оценка текущей позиции ракетки (с учётом невидимых сдвигов)
         self.track = []             # история (x, y) отслеживаемого мяча без отскоков
         self.still = 0
+        self.aim = None
+        self.locked = None
+        self.grid = None
+        self.cycle = 0
+        self.pad_half = 12.0      # полуширина ракетки (бывает расширенной)
 
     # --- меню до игры ---
     def menus(self, f):
@@ -153,11 +245,19 @@ class Player:
         return self.play(f)
 
     def command(self, target, click):
-        """Поставить ракетку в target (центр по x) с учётом невидимых ещё сдвигов."""
-        target = min(max(target, PAD_CENTER_MIN), PAD_CENTER_MAX)
-        dx = int(round((target - self.est) * 4))
+        """Поставить ракетку в target (центр по x) с учётом невидимых ещё сдвигов.
+        Пока недавний сдвиг не проявился на экране, мелкие поправки не шлём: задержка отклика
+        игры немного плавает, и непрерывная обратная связь раскачивает ракетку."""
+        lo, hi = self.pad_range()
+        target = min(max(target, lo), hi)
+        err = target - self.est
+        settling = any(m != 0 for m in self.moves[-(LAG + 1):])
+        if abs(err) < 0.5 or (settling and abs(err) < 4):
+            dx = 0
+        else:
+            dx = int(round(err * 4))
         move = dx / 4
-        self.est = min(max(self.est + move, PAD_CENTER_MIN), PAD_CENTER_MAX)
+        self.est = min(max(self.est + move, lo), hi)
         self.moves = self.moves[1:] + [move]
         return [], Mouse(dx=dx, left=click)
 
@@ -166,7 +266,11 @@ class Player:
         pad = find_paddle(f)
         if pad is not None:
             # экран показывает позицию до последних LAG команд
-            self.est = min(max(pad + sum(self.moves), PAD_CENTER_MIN), PAD_CENTER_MAX)
+            self.pad_half = paddle_half(f) or self.pad_half
+            lo, hi = self.pad_range()
+            self.est = min(max(pad + sum(self.moves[-LAG:]), lo), hi)
+        if self.t % 10 == 0 or self.grid is None:
+            self.grid = read_bricks(f)
         balls = find_balls(f)
         ball = self.pick_ball(balls)
         vel = self.update_track(ball)
@@ -215,8 +319,56 @@ class Player:
     def choose_target(self, ball, vel):
         x, y = ball
         if vel is None or vel[1] <= 0:
+            self.aim = self.locked = None
             return x
-        return self.landing_x(x, y, vel)
+        steps = (BALL_HIT_Y - y) / vel[1]
+        if steps <= LAG + 1 and self.locked is not None:
+            return self.locked          # поздно что-то менять: команда не успеет
+        land = self.landing_x(x, y, vel)
+        if self.aim is None or y < 150:
+            self.aim = self.choose_offset(land, vel)
+        self.locked = land - self.aim
+        return self.locked
+
+    def choose_offset(self, land, vel):
+        """Смещение точки удара, при котором мяч быстрее всего разобьёт кирпич.
+        Поиск на два отскока от ракетки вперёд; если кирпич недостижим — минимальное сближение,
+        при равенстве — чередование вариантов, чтобы не зацикливаться."""
+        if self.grid is None:
+            return 0.0
+        speed = (vel[0] ** 2 + vel[1] ** 2) ** 0.5
+        lo, hi = self.pad_range()
+        options = []
+        for off, (ux, uy) in ZONES:
+            if not lo <= land - off <= hi:
+                continue
+            t, h, bx, bvx, mind = simulate(self.grid, land, BALL_HIT_Y, ux * speed, uy * speed)
+            if h is None:
+                # второй отскок: мяч вернулся в точку bx, выбираем лучшее продолжение
+                best2, mind2 = None, mind
+                for off2, (ux2, uy2) in ZONES:
+                    if not lo <= bx - off2 <= hi:
+                        continue
+                    t2, h2, _, _, md2 = simulate(self.grid, bx, BALL_HIT_Y, ux2 * speed, uy2 * speed, limit=300)
+                    mind2 = min(mind2, md2)
+                    if h2 is not None and (best2 is None or t2 < best2):
+                        best2 = t2
+                score = (1, t + best2, 0) if best2 is not None else (2, mind2, 0)
+            else:
+                score = (0, t, 0)
+            options.append((score, off))
+        if not options:
+            return 0.0
+        options.sort()
+        if options[0][0][0] == 2:
+            # ничего не достижимо — чередуем, иначе траектория повторяется вечно
+            self.cycle += 1
+            return options[self.cycle % len(options)][1]
+        return options[0][1]
+
+    def pad_range(self):
+        hw = self.pad_half
+        return FIELD_L + hw, FIELD_R - 1 - hw
 
     @staticmethod
     def landing_x(x, y, vel):
