@@ -221,6 +221,55 @@ def simulate(grid, x, y, vx, vy, limit=400):
     return limit, None, x, vx, mind
 
 
+def simulate_rate(grid, x, y, vx, vy, limit=1500):
+    """Полёт до возвращения к ракетке с разбиванием кирпичей (обычный — 1, удар по серебряному — 0.5, золото
+    отражает). Возвращает (ценность разбитого, кадров полёта)."""
+    g = grid.copy()
+    value = 0.0
+
+    def hit(px, py):
+        c = int((px - 41 + R) // 16), int((px - 41 - R) // 16)
+        r = int((py - 1 + R) // 8), int((py - 1 - R) // 8)
+        for rr in {r[0], r[1]}:
+            for cc in {c[0], c[1]}:
+                if 0 <= rr < ROWS and 0 <= cc < COLS and g[rr, cc]:
+                    bx, by = 41 + 16 * cc, 1 + 8 * rr
+                    if bx - R <= px < bx + 15 + R and by - R <= py < by + 7 + R:
+                        return rr, cc
+        return None
+
+    def smash(h):
+        nonlocal value
+        k = g[h]
+        if k == NORMAL:
+            value += 1.0
+            g[h] = EMPTY
+        elif k == SILVER:
+            value += 0.5
+    for t in range(1, limit):
+        nx = x + vx
+        h = hit(nx, y)
+        if h:
+            smash(h)
+            vx = -vx
+        elif nx < BALL_X_MIN or nx > BALL_X_MAX:
+            vx = -vx
+        else:
+            x = nx
+        ny = y + vy
+        h = hit(x, ny)
+        if h:
+            smash(h)
+            vy = -vy
+        elif ny < BALL_Y_MIN:
+            vy = -vy
+        else:
+            y = ny
+        if y > BALL_HIT_Y:
+            return value, t
+    return value, limit
+
+
 class Player:
     def __init__(self):
         self.t = 0
@@ -441,6 +490,15 @@ class Player:
             return 0.0
         speed = (vel[0] ** 2 + vel[1] ** 2) ** 0.5
         lo, hi = self.pad_range()
+        # главный критерий: разбитое за полёт / время полёта (поощряет загнать мяч за стену кирпичей)
+        rated = []
+        for off, (ux, uy) in ZONES:
+            if lo <= land - off <= hi:
+                v, t = simulate_rate(self.grid, land, BALL_HIT_Y, ux * speed, uy * speed)
+                if v > 0:
+                    rated.append((v / (t + 20), off))
+        if rated:
+            return max(rated)[1]
         options = []
         for off, (ux, uy) in ZONES:
             if not lo <= land - off <= hi:

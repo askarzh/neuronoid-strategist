@@ -20,6 +20,7 @@ def main(minutes=20.0, outdir="runs/bench", every=2000):
     f = emu.frame()
     score, lives, last_lives = 0, None, None
     events = []
+    rounds = []  # (кадр, сумма пикселей надписи номера раунда) — смена = новый раунд
     ring = []  # последние кадры с состоянием игрока — для разбора потерь
     for t in range(n):
         keys, mouse = pl.act(f)
@@ -38,11 +39,15 @@ def main(minutes=20.0, outdir="runs/bench", every=2000):
                     for tt, ff, s in ring:
                         fh.write(f"{tt} {s}\n"); Image.fromarray(ff).save(d / f"{tt:06d}.png")
             last_lives = lv
+            rk = int(f[124:134, 250:290].sum())
+            if not rounds or rounds[-1][1] != rk:
+                rounds.append((t, rk, score))
         if t % every == 0:
             Image.fromarray(f).save(out / f"f{t:06d}.png")
         if t % int(60 * emu.fps) == 0:
             print(f"min {t/emu.fps/60:5.1f} score {score} lives {last_lives}", flush=True)
     Image.fromarray(f).save(out / "final.png")
+    print("rounds (start frame, score):", [(r[0], r[2]) for r in rounds])
     print(f"FINAL score {score} lives {last_lives}; events {events}; {time.time()-t0:.0f}s")
 
 
