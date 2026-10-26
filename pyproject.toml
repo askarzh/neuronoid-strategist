@@ -1,0 +1,11 @@
+[project]
+name = "neuronoid-strategist"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = ["libretro.py==0.12.*", "numpy", "pillow", "opencv-python-headless"]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.uv]
+package = false
