@@ -114,6 +114,30 @@ def blue_menu(f):
     return f.shape == (400, 640, 3) and (f[::8, ::8] == [0, 0, 170]).all(2).mean() > 0.3
 
 
+CAPSULE_SPEED = 1.0                 # пикс/кадр (измерено: y 82 -> 136 за 54 кадра)
+
+# --- капсулы: «таблетки» 16x7, падают ~1 px/кадр строго по столбцам (левый край x = 40+16c) ---
+CAPSULE_COLORS = {(0, 170, 0): "green", (170, 0, 0): "red", (170, 85, 0): "brown", (0, 170, 170): "cyan",
+                  (85, 85, 255): "blue", (170, 0, 170): "magenta", (85, 85, 85): "gray"}
+
+
+def find_capsules(f):
+    """[(цвет, x центра, y низа)] — по краям таблетки: столбцы x0+1 и x0+14 одного цвета корпуса в 3 строках."""
+    res = []
+    for c in range(COLS):
+        x0 = 40 + 16 * c
+        a, b = f[8:186, x0 + 1], f[8:186, x0 + 14]
+        same = (a == b).all(1)
+        for col, name in CAPSULE_COLORS.items():
+            m = same & (a == col).all(1)
+            ys = np.flatnonzero(m[:-2] & m[1:-1] & m[2:])
+            if len(ys):
+                y = int(ys[-1]) + 8
+                # корпус: строки сверху и снизу от середины; низ капсулы ~ на 3 строки ниже найденной тройки
+                res.append((name, x0 + 7.5, y + 4))
+    return res
+
+
 # --- кирпичи: сетка 11 столбцов x 22 ряда, ячейка 16x8, кирпич 15x7 в (41+16c, 1+8r) ---
 ROWS, COLS = 22, 11
 EMPTY, NORMAL, SILVER, GOLD = 0, 1, 2, 3
@@ -206,6 +230,8 @@ class Player:
         self.grid = None
         self.cycle = 0
         self.pad_half = 12.0      # полуширина ракетки (бывает расширенной)
+        self.caps_prev = []
+        self.avoid = set()        # цвета капсул, которые не ловим
 
     # --- меню до игры ---
     def menus(self, f):
@@ -275,9 +301,13 @@ class Player:
         ball = self.pick_ball(balls)
         vel = self.update_track(ball)
 
+        caps = self.update_capsules(f)
         target, click = self.est, False
         if ball is not None:
             target = self.choose_target(ball, vel)
+            cap = self.capsule_to_catch(caps, ball, vel)
+            if cap is not None:
+                target = cap
             # мяч лежит на ракетке — запустить
             if vel is not None and vel == (0.0, 0.0) and ball[1] >= PADDLE_TOP - 6:
                 self.still += 1
@@ -285,6 +315,35 @@ class Player:
                 self.still = 0
             click = self.still > 5 and self.still % 10 < 2
         return self.command(target, click)
+
+    def update_capsules(self, f):
+        """Капсулы, подтверждённые движением вниз (тот же столбец, y вырос на 0..3 с прошлого кадра)."""
+        cur = find_capsules(f)
+        ok = [c for c in cur if any(p[1] == c[1] and 0 <= c[2] - p[2] <= 3 and p[0] == c[0] for p in self.caps_prev)]
+        self.caps_prev = cur
+        return ok
+
+    def capsule_to_catch(self, caps, ball, vel):
+        """Центр капсулы, под которую стоит встать сейчас, или None (мяч важнее)."""
+        if not caps or vel is None:
+            return None
+        x, y = ball
+        vy = vel[1]
+        if abs(vy) < 0.3:
+            return None
+        # не раньше, чем через столько кадров мяч может оказаться у ракетки
+        t_ball = (BALL_HIT_Y - y) / abs(vy)
+        best = None
+        for name, cx, cy in caps:
+            if name in self.avoid:
+                continue
+            t_cap = (PADDLE_TOP - cy) / CAPSULE_SPEED
+            if t_cap > LAG + 2 or t_cap < -5:
+                continue                    # рано идти / уже пролетела
+            if t_ball < t_cap + 2 * LAG + 6:
+                continue                    # не успеем вернуться к мячу
+            best = cx
+        return best
 
     def pick_ball(self, balls):
         if not balls:
