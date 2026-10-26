@@ -13,6 +13,7 @@
 за тем, что раньше всех долетит до ракетки.
 """
 
+import cv2
 import numpy as np
 
 from body import Key, Mouse
@@ -127,6 +128,7 @@ def blue_menu(f):
     return f.shape == (400, 640, 3) and (f[::8, ::8] == [0, 0, 170]).all(2).mean() > 0.3
 
 
+STALL_FRAMES = 2500                  # столько кадров без изменений = зацикливание
 CAPSULE_SPEED = 1.0                 # пикс/кадр (измерено: y 82 -> 136 за 54 кадра)
 
 # --- капсулы: «таблетки» 16x7, падают ~1 px/кадр строго по столбцам (левый край x = 40+16c) ---
@@ -283,7 +285,10 @@ class Player:
         self.phase = "boot"
         self.phase_t = 0
         self.snapshot = None
-        self.moves = [0.0] * (LAG + 1)  # сдвиги ракетки по последним командам, ещё не видимые на экране
+        self.lag = LAG
+        self.pad_obs = []
+        self.cmd_hist = []
+        self.moves = [0.0] * 5  # сдвиги ракетки по последним командам, ещё не видимые на экране
         self.est = 128.0            # оценка текущей позиции ракетки (с учётом невидимых сдвигов)
         self.tracks = []            # треки всех мячей
         self.track = []             # история (x, y) отслеживаемого мяча без отскоков
@@ -294,6 +299,10 @@ class Player:
         self.cycle = 0
         self.pad_half = 12.0      # полуширина ракетки (бывает расширенной)
         self.caps_prev = []
+        self.shots = []
+        self.progress_sig, self.progress_t = None, 0
+        self.rng = 12345
+        self.rest_prev = None
         self.avoid = set()        # цвета капсул, которые не ловим
 
     # --- меню до игры ---
@@ -334,32 +343,66 @@ class Player:
         return self.play(f)
 
     def command(self, target, click):
+        self.last_target = target
         """Поставить ракетку в target (центр по x) с учётом невидимых ещё сдвигов.
         Пока недавний сдвиг не проявился на экране, мелкие поправки не шлём: задержка отклика
         игры немного плавает, и непрерывная обратная связь раскачивает ракетку."""
         lo, hi = self.pad_range()
         target = min(max(target, lo), hi)
         err = target - self.est
-        settling = any(m != 0 for m in self.moves[-(LAG + 1):])
-        if abs(err) < 0.5 or (settling and abs(err) < 4):
+        # после хода ждём, пока он наверняка проявится (задержка 2..3 кадра и плавает), и лишь потом
+        # поправляем; сразу — только большие переносы (новая цель)
+        settling = any(m != 0 for m in self.moves[-4:])
+        if abs(err) < 0.5 or (settling and abs(err) < 15):
             dx = 0
         else:
             dx = int(round(err * 4))
         move = dx / 4
         self.est = min(max(self.est + move, lo), hi)
         self.moves = self.moves[1:] + [move]
+        self.cmd_hist = (self.cmd_hist + [self.est])[-24:]
         return [], Mouse(dx=dx, left=click)
+
+    def estimate_lag(self):
+        """Задержка (1..4 кадра), при которой видимые положения ракетки лучше всего совпадают с командами."""
+        obs, cmd = self.pad_obs, self.cmd_hist
+        n = min(len(obs), len(cmd))
+        if n < 12:
+            return self.lag
+        best, be = self.lag, None
+        for L in (1, 2, 3, 4):
+            # obs[-1] — кадр после команды cmd[-1]; при задержке L он показывает cmd[-1-L]... (cmd[-L-1+1])
+            e = 0.0; k = 0
+            for i in range(1, n - L):
+                o, c = obs[-i], cmd[-i - L]
+                if o is not None:
+                    e += min(abs(o - c), 30); k += 1
+            if k >= 6:
+                e /= k
+                if be is None or e < be - 0.3 or (abs(e - be) <= 0.3 and L == self.lag):
+                    best, be = L, e
+        return best
 
     # --- игра ---
     def play(self, f):
         pad = find_paddle(f)
         if pad is not None:
-            # экран показывает позицию до последних LAG команд
+            # экран показывает позицию до последних lag команд; lag обычно 3, но бывает 2 (раунд 33) —
+            # оцениваем по тому, какая задержка лучше объясняет видимые положения ракетки
             self.pad_half = paddle_half(f) or self.pad_half
+            self.pad_obs = (self.pad_obs + [pad])[-24:]
+            self.lag = self.estimate_lag()
             lo, hi = self.pad_range()
-            self.est = min(max(pad + sum(self.moves[-LAG:]), lo), hi)
+            self.est = min(max(pad + sum(self.moves[len(self.moves) - self.lag:]), lo), hi)
+        else:
+            self.pad_obs = (self.pad_obs + [None])[-24:]
         if self.t % 10 == 0 or self.grid is None:
             self.grid = read_bricks(f)
+            # застой: счёт не меняется — траектория зациклилась (по сетке нельзя: враги над кирпичами
+            # всё время меняют распознанные клетки)
+            sig = read_score(f)
+            if sig is not None and sig != self.progress_sig:
+                self.progress_sig, self.progress_t = sig, self.t
         balls = find_balls(f)
         ball = self.pick_ball(balls)
         vel = self.update_track(ball)
@@ -377,15 +420,80 @@ class Player:
                 lt = self.laser_target()
                 if lt is not None:
                     target = lt
-            # мяч лежит на ракетке — запустить
-            if vel is not None and vel == (0.0, 0.0) and ball[1] >= PADDLE_TOP - 6:
+            # мяч лежит на ракетке — не гнаться за ним, а запустить. Он едет вместе с ракеткой, но
+            # с лишней задержкой ~2 кадра, поэтому признак покоя — неизменная высота, а не положение.
+            if 171 <= ball[1] <= 174 and ball[1] == self.rest_prev:
                 self.still += 1
             else:
                 self.still = 0
-            click = self.still > 5 and self.still % 10 < 2
+            self.rest_prev = ball[1]
+            if self.still >= 3:
+                target = self.est
+                click = self.still % 4 < 2
         if laser and self.t % 2 == 0:
             click = True                   # лазер: стреляем непрерывно
+        shots = self.update_shots(f, balls)
+        if shots:
+            target = self.dodge(target, shots, ball, vel)
         return self.command(target, click)
+
+    # --- снаряды босса (раунд 33): бело-серые осколки ~7x7, летят вниз по наклонной ---
+    def update_shots(self, f, balls):
+        reg = (f[60:176, FIELD_L:FIELD_R] == W).all(2)
+        for bx, by in balls:                      # мячи не считаем
+            y0, x0 = by - 3 - 60, bx - 3 - FIELD_L
+            reg[max(y0, 0):max(y0 + 7, 0), max(x0, 0):max(x0 + 7, 0)] = False
+        cur = []
+        if reg.any():
+            n, lab, st, cen = cv2.connectedComponentsWithStats(reg.astype(np.uint8))
+            for i in range(1, n):
+                if 4 <= st[i, 4] <= 64 and st[i, 2] <= 10 and st[i, 3] <= 10:
+                    cur.append((cen[i][0] + FIELD_L, cen[i][1] + 60))
+        tracks = []
+        for c in cur:
+            prev = [tr for tr in self.shots if 0 < c[1] - tr[-1][1] <= 6 and abs(c[0] - tr[-1][0]) <= 4]
+            tracks.append((min(prev, key=lambda tr: abs(c[0] - tr[-1][0])) + [c])[-8:] if prev else [c])
+        self.shots = tracks
+        return [tr for tr in tracks if len(tr) >= 3]
+
+    def shot_hits(self, shots, horizon):
+        """[(кадров до строки ракетки, x)] для снарядов, которые долетят в пределах horizon кадров."""
+        res = []
+        for tr in shots:
+            n = len(tr)
+            vx = (tr[-1][0] - tr[0][0]) / (n - 1)
+            vy = (tr[-1][1] - tr[0][1]) / (n - 1)
+            if vy <= 0.3:
+                continue
+            T = (PADDLE_TOP - 3 - tr[-1][1]) / vy
+            if -2 <= T <= horizon:
+                res.append((T, tr[-1][0] + vx * max(T, 0)))
+        return res
+
+    def dodge(self, target, shots, ball, vel):
+        """Сдвинуть цель так, чтобы снаряды не попали в ракетку; мяч при этом не упустить."""
+        hits = self.shot_hits(shots, LAG + 14)
+        if not hits:
+            return target
+        margin = self.pad_half + 12          # попадание засчитывается щедрее видимых контуров
+
+        def safe(x):
+            return all(abs(x - hx) >= margin for _, hx in hits)
+        if safe(target):
+            return target
+        lo, hi = self.pad_range()
+        cands = np.arange(lo, hi + 0.1, 1.0)
+        # мяч на подлёте: ракетка должна остаться под ним (смещение не больше 10)
+        if ball is not None and vel is not None and vel[1] > 0:
+            steps = (BALL_HIT_Y - ball[1]) / vel[1]
+            if steps < LAG + 16:
+                land = self.locked if self.locked is not None else self.landing_x(ball[0], ball[1], vel)
+                band = [c for c in cands if abs(c - land) <= 10 and safe(c)]
+                if band:
+                    return min(band, key=lambda c: abs(c - target))
+                return target                     # некуда — мяч важнее
+        ok = [c for c in cands if safe(c)]
+        return min(ok, key=lambda c: abs(c - target)) if ok else target
 
     def free_time(self, ball, vel):
         """Мяч не долетит до ракетки раньше, чем мы успеем отойти и вернуться."""
@@ -534,6 +642,12 @@ class Player:
             return 0.0
         speed = (vel[0] ** 2 + vel[1] ** 2) ** 0.5
         lo, hi = self.pad_range()
+        if self.t - self.progress_t > STALL_FRAMES:
+            # цикл: модель уверена, а на деле ничего не разбивается — пробуем углы вразнобой
+            ok = [off for off, _ in ZONES if lo <= land - off <= hi]
+            if ok:
+                self.rng = (self.rng * 1103515245 + 12345) % (1 << 31)
+                return ok[(self.rng >> 8) % len(ok)]
         # главный критерий: разбитое за полёт / время полёта (поощряет загнать мяч за стену кирпичей)
         rated = []
         for off, (ux, uy) in ZONES:
