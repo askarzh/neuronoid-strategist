@@ -6,10 +6,12 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from body import power_on
-import player as P
+import importlib.util, os
+_pf = os.environ.get("PLAYER", "player.py")  # другой файл игрока для сравнения версий
+_spec = importlib.util.spec_from_file_location("player", _pf); P = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(P)
 
 
-def main(minutes=20.0, outdir="runs/bench", every=2000):
+def main(minutes=20.0, outdir="runs/bench", every=2000, delay=0):
     out = Path(outdir); out.mkdir(parents=True, exist_ok=True)
     for p in out.glob("*.png"): p.unlink()
     emu = power_on()
@@ -23,7 +25,7 @@ def main(minutes=20.0, outdir="runs/bench", every=2000):
     rounds = []  # (кадр, сумма пикселей надписи номера раунда) — смена = новый раунд
     ring = []  # последние кадры с состоянием игрока — для разбора потерь
     for t in range(n):
-        keys, mouse = pl.act(f)
+        keys, mouse = pl.act(f) if t >= delay else ([], P.Mouse())
         ring.append((t, f, f"ball {pl.track[-1] if pl.track else None} n={len(pl.track)} aim {pl.aim} est {pl.est:.1f} pad {P.find_paddle(f) if f.shape[0]==200 else None} dx {mouse.dx}"))
         ring = ring[-150:]
         emu.step(keys, frames=1, mouse=mouse)
@@ -52,4 +54,5 @@ def main(minutes=20.0, outdir="runs/bench", every=2000):
 
 
 if __name__ == "__main__":
-    main(float(sys.argv[1]) if len(sys.argv) > 1 else 20.0, sys.argv[2] if len(sys.argv) > 2 else "runs/bench")
+    main(float(sys.argv[1]) if len(sys.argv) > 1 else 20.0, sys.argv[2] if len(sys.argv) > 2 else "runs/bench",
+         delay=int(sys.argv[3]) if len(sys.argv) > 3 else 0)

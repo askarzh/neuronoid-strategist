@@ -17,6 +17,7 @@ PADDLE_TOP = 176                    # верх ракетки
 PAD_CENTER_MIN, PAD_CENTER_MAX = 52, 203
 LAG = 3                             # кадров между командой мыши и её видимостью на экране
 BALL_HIT_Y = 173                    # центр мяча по y в момент удара о ракетку
+LAND_Y = 173.0                      # для прогноза точки касания по x
 BALL_X_MIN, BALL_X_MAX = 42, 214    # крайние положения центра мяча по x (у стенок)
 
 W = np.array([255, 255, 255], np.uint8)
@@ -278,6 +279,7 @@ class Player:
         self.snapshot = None
         self.moves = [0.0] * (LAG + 1)  # сдвиги ракетки по последним командам, ещё не видимые на экране
         self.est = 128.0            # оценка текущей позиции ракетки (с учётом невидимых сдвигов)
+        self.tracks = []            # треки всех мячей
         self.track = []             # история (x, y) отслеживаемого мяча без отскоков
         self.still = 0
         self.aim = None
@@ -439,12 +441,48 @@ class Player:
         return best
 
     def pick_ball(self, balls):
-        if not balls:
+        """Несколько мячей: ведём трек каждого, следим за тем, что раньше всех долетит до ракетки."""
+        tracks, free = [], list(balls)
+        for tr in self.tracks:
+            if not free:
+                break
+            n = len(tr)
+            v = ((tr[-1][0] - tr[0][0]) / (n - 1), (tr[-1][1] - tr[0][1]) / (n - 1)) if n >= 2 else (0, 0)
+            px, py = tr[-1][0] + v[0], tr[-1][1] + v[1]
+            b = min(free, key=lambda b: abs(b[0] - px) + abs(b[1] - py))
+            if abs(b[0] - px) + abs(b[1] - py) <= 10:
+                free.remove(b)
+                tracks.append(self._extend(tr, b))
+        tracks += [[b] for b in free]
+        self.tracks = tracks
+        if not tracks:
             return None
-        if self.track:
-            lx, ly = self.track[-1]
-            return min(balls, key=lambda b: abs(b[0] - lx) + abs(b[1] - ly))
-        return max(balls, key=lambda b: b[1])
+
+        def urgency(tr):
+            n = len(tr)
+            if n < 3:
+                return 300.0
+            vy = (tr[-1][1] - tr[0][1]) / (n - 1)
+            y = tr[-1][1]
+            return (BALL_HIT_Y - y) / vy if vy > 0.3 else 400.0 - y
+        best = min(tracks, key=urgency)
+        cur = next((tr for tr in tracks if self.track and len(tr) >= 2 and tr[-2] == self.track[-1]), None)
+        if cur is not None and urgency(cur) <= urgency(best) + 6:
+            best = cur
+        elif cur is not best:
+            self.aim = self.locked = None
+        self.track = best[:-1]       # update_track допишет последнюю точку
+        return best[-1]
+
+    @staticmethod
+    def _extend(tr, ball):
+        if len(tr) >= 2:
+            n = len(tr)
+            vx = (tr[-1][0] - tr[0][0]) / (n - 1)
+            vy = (tr[-1][1] - tr[0][1]) / (n - 1)
+            if abs(ball[0] - tr[-1][0] - vx) > 2.5 or abs(ball[1] - tr[-1][1] - vy) > 2.5:
+                tr = [tr[-1]]
+        return (tr + [ball])[-12:]
 
     def update_track(self, ball):
         """Скорость мяча по прямолинейному участку траектории (сброс при отскоке)."""
@@ -533,9 +571,10 @@ class Player:
 
     @staticmethod
     def landing_x(x, y, vel):
-        """Где будет центр мяча на высоте удара о ракетку (с отражениями от боковых стенок)."""
+        """Где будет центр мяча в момент удара о ракетку (с отражениями от боковых стенок).
+        Касание фактически происходит чуть ниже 173 (пологий мяч успевает сдвинуться ещё на кадр)."""
         vx, vy = vel
-        steps = (BALL_HIT_Y - y) / vy
+        steps = (LAND_Y - y) / vy
         px = x + vx * steps
         lo, hi = BALL_X_MIN, BALL_X_MAX
         span = hi - lo
