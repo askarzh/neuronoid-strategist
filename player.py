@@ -45,6 +45,12 @@ def find_paddle(f):
     return (run[0] + run[-1]) / 2 + FIELD_L
 
 
+def has_laser(f, pad):
+    """Лазерная ракетка: в строке 179 внутри корпуса красные полосы (у обычной — серый корпус)."""
+    x = int(round(pad))
+    return (f[179, x - 5] == (170, 0, 0)).all() and (f[179, x + 5] == (170, 0, 0)).all()
+
+
 def paddle_half(f):
     """Полуширина ракетки: белая полоса + 5 пикселей с каждой стороны (красные концы)."""
     row = (f[177, FIELD_L:FIELD_R] == W).all(1)
@@ -302,19 +308,57 @@ class Player:
         vel = self.update_track(ball)
 
         caps = self.update_capsules(f)
+        laser = pad is not None and has_laser(f, pad)
         target, click = self.est, False
         if ball is not None:
             target = self.choose_target(ball, vel)
+            free = self.free_time(ball, vel)
             cap = self.capsule_to_catch(caps, ball, vel)
             if cap is not None:
                 target = cap
+            elif laser and free:
+                lt = self.laser_target()
+                if lt is not None:
+                    target = lt
             # мяч лежит на ракетке — запустить
             if vel is not None and vel == (0.0, 0.0) and ball[1] >= PADDLE_TOP - 6:
                 self.still += 1
             else:
                 self.still = 0
             click = self.still > 5 and self.still % 10 < 2
+        if laser and self.t % 2 == 0:
+            click = True                   # лазер: стреляем непрерывно
         return self.command(target, click)
+
+    def free_time(self, ball, vel):
+        """Мяч не долетит до ракетки раньше, чем мы успеем отойти и вернуться."""
+        if vel is None or abs(vel[1]) < 0.3:
+            return False
+        return (BALL_HIT_Y - ball[1]) / abs(vel[1]) > 2 * LAG + 8
+
+    def laser_target(self):
+        """Центр ракетки, при котором лучи (центр ±8) попадут в нижние разбиваемые кирпичи двух столбцов."""
+        if self.grid is None:
+            return None
+        val = []
+        for c in range(COLS):
+            col = self.grid[:, c]
+            nz = np.flatnonzero(col)
+            v = 0.0
+            if len(nz):
+                k = col[nz[-1]]
+                v = 1.0 if k == NORMAL else 0.5 if k == SILVER else 0.0
+            val.append(v)
+        lo, hi = self.pad_range()
+        best, bs = None, 0.0
+        for c in range(COLS - 1):
+            x = 56 + 16 * c
+            if not lo <= x <= hi:
+                continue
+            s = val[c] + val[c + 1] - abs(x - self.est) / 1000
+            if s > bs:
+                best, bs = x, s
+        return best
 
     def update_capsules(self, f):
         """Капсулы, подтверждённые движением вниз (тот же столбец, y вырос на 0..3 с прошлого кадра)."""
