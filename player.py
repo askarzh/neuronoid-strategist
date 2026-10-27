@@ -128,6 +128,7 @@ def blue_menu(f):
     return f.shape == (400, 640, 3) and (f[::8, ::8] == [0, 0, 170]).all(2).mean() > 0.3
 
 
+SACRIFICE_FRAMES = 10000             # застой дольше — пропустить мяч и подать заново
 STALL_FRAMES = 2500                  # столько кадров без изменений = зацикливание
 CAPSULE_SPEED = 1.0                 # пикс/кадр (измерено: y 82 -> 136 за 54 кадра)
 
@@ -181,6 +182,8 @@ def read_bricks(f):
 # Пологие зоны ([-12,-9] и [8,12]) не используем: пологий мяч на высокой скорости слишком легко
 # упустить краем ракетки (3 потери из 3 в прогоне b5), а угол подлёта всегда равен углу отскока.
 ZONES = [(-6.5, (-0.707, -0.707)), (-2.5, (-0.26, -0.97)), (1.5, (0.26, -0.97)), (5.5, (0.707, -0.707))]
+# пологие зоны — только чтобы вырваться из долгого застоя (другая геометрия траекторий)
+SHALLOW = [(-9.5, (-0.95, -0.30)), (9.0, (0.95, -0.30))]
 BALL_Y_MIN = 10
 R = 2.5  # полуразмер мяча
 
@@ -302,6 +305,8 @@ class Player:
         self.shots = []
         self.progress_sig, self.progress_t = None, 0
         self.cnt_hist = []
+        self.serve_pick = False
+        self.serve_x = None
         self.rng = 12345
         self.rest_prev = None
         self.avoid = set()        # цвета капсул, которые не ловим
@@ -403,8 +408,10 @@ class Player:
             # он растёт и без прогресса (сбитые враги, раунд 25). Враги, пролетая над клетками, на время
             # «стирают» кирпичи, поэтому берём максимум за последние 30 замеров (300 кадров).
             self.cnt_hist = (self.cnt_hist + [int(((self.grid == NORMAL) | (self.grid == SILVER)).sum())])[-30:]
+            # Прогресс — только новый минимум за раунд: враг поверх пустой клетки изредка даёт лишний «кирпич»,
+            # и простое «число изменилось» сбрасывало застой (раунд 25). Рост больше чем на 5 — новый раунд.
             cnt = max(self.cnt_hist)
-            if self.progress_sig is None or cnt != self.progress_sig:
+            if self.progress_sig is None or cnt < self.progress_sig or cnt > self.progress_sig + 5:
                 self.progress_sig, self.progress_t = cnt, self.t
         balls = find_balls(f)
         ball = self.pick_ball(balls)
@@ -432,7 +439,25 @@ class Player:
             self.rest_prev = ball[1]
             if self.still >= 3:
                 target = self.est
-                click = self.still % 4 < 2
+                if self.serve_pick:
+                    # подача после намеренной потери мяча: позицию выбираем симуляцией
+                    if self.serve_x is None and pad is not None:
+                        self.serve_x = self.choose_serve(ball[0] - pad)
+                    target = self.serve_x if self.serve_x is not None else self.est
+                    ready = pad is not None and abs(pad - target) <= 1 and not any(self.moves[-4:])
+                    click = (ready or self.still > 90) and self.still % 4 < 2
+                    if click:
+                        self.serve_pick, self.serve_x = False, None
+                        self.progress_t = self.t
+                else:
+                    click = self.still % 4 < 2
+            elif self.sacrifice_ok(f) and vel is not None and vel[1] > 0:
+                # долгий застой: траектории заперты «воронкой» из золота — намеренно пропускаем мяч,
+                # чтобы подать заново с выбранной позиции
+                lo, hi = self.pad_range()
+                land = self.landing_x(ball[0], ball[1], vel)
+                target = lo if land - lo > hi - land else hi
+                self.serve_pick = True
         if laser and self.t % 2 == 0:
             click = True                   # лазер: стреляем непрерывно
         shots = self.update_shots(f, balls)
@@ -497,6 +522,30 @@ class Player:
                 return target                     # некуда — мяч важнее
         ok = [c for c in cands if safe(c)]
         return min(ok, key=lambda c: abs(c - target)) if ok else target
+
+    def sacrifice_ok(self, f):
+        """Пропустить мяч ради новой подачи: застой очень долгий, есть запас жизней и золото на поле
+        (в раунде босса золота нет — там так нельзя)."""
+        if self.t - self.progress_t <= SACRIFICE_FRAMES or self.grid is None:
+            return False
+        return count_lives(f) >= 2 and (self.grid == GOLD).any()
+
+    def choose_serve(self, off):
+        """Позиция ракетки для подачи: мяч уходит из (центр+off) крутым углом вправо (измерено)."""
+        if self.grid is None:
+            return None
+        lo, hi = self.pad_range()
+        best, bs = None, 0.0
+        for cx in np.arange(lo, hi + 0.1, 2.0):
+            v, t = simulate_rate(self.grid, cx + off, BALL_HIT_Y, 0.65, -2.45)
+            s = v / (t + 20)
+            if s > bs:
+                best, bs = float(cx), s
+        if best is None:
+            # прямого попадания нет — хотя бы новая точка: случайная позиция
+            self.rng = (self.rng * 1103515245 + 12345) % (1 << 31)
+            best = lo + (self.rng >> 8) % int(hi - lo)
+        return best
 
     def free_time(self, ball, vel):
         """Мяч не долетит до ракетки раньше, чем мы успеем отойти и вернуться."""
@@ -647,7 +696,8 @@ class Player:
         lo, hi = self.pad_range()
         if self.t - self.progress_t > STALL_FRAMES:
             # цикл: модель уверена, а на деле ничего не разбивается — пробуем углы вразнобой
-            ok = [off for off, _ in ZONES if lo <= land - off <= hi]
+            zones = ZONES + SHALLOW if self.t - self.progress_t > 2 * STALL_FRAMES else ZONES
+            ok = [off for off, _ in zones if lo <= land - off <= hi]
             if ok:
                 self.rng = (self.rng * 1103515245 + 12345) % (1 << 31)
                 return ok[(self.rng >> 8) % len(ok)]
