@@ -301,6 +301,7 @@ class Player:
         self.caps_prev = []
         self.shots = []
         self.progress_sig, self.progress_t = None, 0
+        self.cnt_hist = []
         self.rng = 12345
         self.rest_prev = None
         self.avoid = set()        # цвета капсул, которые не ловим
@@ -398,11 +399,13 @@ class Player:
             self.pad_obs = (self.pad_obs + [None])[-24:]
         if self.t % 10 == 0 or self.grid is None:
             self.grid = read_bricks(f)
-            # застой: счёт не меняется — траектория зациклилась (по сетке нельзя: враги над кирпичами
-            # всё время меняют распознанные клетки)
-            sig = read_score(f)
-            if sig is not None and sig != self.progress_sig:
-                self.progress_sig, self.progress_t = sig, self.t
+            # застой: число разбиваемых кирпичей не уменьшается — траектория зациклилась. По счёту нельзя:
+            # он растёт и без прогресса (сбитые враги, раунд 25). Враги, пролетая над клетками, на время
+            # «стирают» кирпичи, поэтому берём максимум за последние 30 замеров (300 кадров).
+            self.cnt_hist = (self.cnt_hist + [int(((self.grid == NORMAL) | (self.grid == SILVER)).sum())])[-30:]
+            cnt = max(self.cnt_hist)
+            if self.progress_sig is None or cnt != self.progress_sig:
+                self.progress_sig, self.progress_t = cnt, self.t
         balls = find_balls(f)
         ball = self.pick_ball(balls)
         vel = self.update_track(ball)
